@@ -1,69 +1,132 @@
+"""
+main.py
+-------
+Phase 3 Orchestrator — Producer-Consumer Pipeline with Multiprocessing.
+
+Architecture:
+                    raw_queue          processed_queue      result_queue
+  [InputProcess] ─────────► [Worker x N] ──────────► [Aggregator] ──────► [Dashboard]
+                                  ▲ Scatter-Gather ▲
+                                        │
+                              [PipelineTelemetry] ──► telemetry_queue ──► [Dashboard]
+
+Dependency Injection order:
+  1. Create Queues
+  2. Start Telemetry monitor (Subject)
+  3. Start Dashboard process (Observer subscribed to telemetry)
+  4. Start Aggregator process
+  5. Start N Worker processes  (Scatter)
+  6. Start Input process       (Producer)
+"""
+
 import json
 import sys
+import multiprocessing
+import threading
+import time
 
-# Factory Imports
-from plugins.inputs import CSVReader, JSONReader
-from plugins.outputs import ConsoleWriter, GraphicsChartWriter, StreamlitDashboard
-from core.engine import TransformationEngine
+from core.engine    import worker_process, aggregator_process
+from core.telemetry import PipelineTelemetry
+from plugins.inputs  import input_process
+from plugins.outputs import dashboard_process, TelemetryObserver
 
-
-# ── 1. Dictionary-based Factories ──
-INPUT_DRIVERS = {
-    "csv": CSVReader,
-    "json": JSONReader,
-}
-
-OUTPUT_DRIVERS = {
-    "console": ConsoleWriter,
-    "graphics": GraphicsChartWriter,
-    "ui": StreamlitDashboard,
-}
 
 def load_config(path: str = "config.json") -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        print(f"[ERROR] Could not load config: {e}")
+    except FileNotFoundError:
+        print(f"[ERROR] config.json not found at: {path}")
         sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Invalid JSON: {e}")
+        sys.exit(1)
+
 
 def bootstrap():
-    # ── 1. Load Configuration ──
     config = load_config("config.json")
 
-    input_cfg = config.get("input", {})
-    output_cfg = config.get("output", {})
+    dynamics    = config.get("pipeline_dynamics", {})
+    parallelism = int(dynamics.get("core_parallelism", 4))
+    max_size    = int(dynamics.get("stream_queue_max_size", 50))
 
-    input_driver_key = input_cfg.get("driver", "csv")
-    output_driver_key = output_cfg.get("driver", "console")
-    file_path = input_cfg.get("file_path", "gdp.csv")
+    processing  = config.get("processing", {})
+    stateless   = processing.get("stateless_tasks", {})
+    stateful    = processing.get("stateful_tasks", {})
 
-    # ── 2. Instantiate Output (The Sink) ──
-    SinkClass = OUTPUT_DRIVERS.get(output_driver_key)
-    if not SinkClass:
-        print(f"Unknown output: {output_driver_key}")
-        sys.exit(1)
-    
-    sink = SinkClass()
+    secret_key  = stateless.get("secret_key", "")
+    iterations  = int(stateless.get("iterations", 100000))
+    window_size = int(stateful.get("running_average_window_size", 10))
 
-    # ── 3. Instantiate Core (Dependency Injection of Sink) ──
-    engine = TransformationEngine(sink=sink, config=config)
+    # ── 1. Create the three queues ────────────────────────────────────
+    raw_queue       = multiprocessing.Queue(maxsize=max_size)
+    processed_queue = multiprocessing.Queue(maxsize=max_size)
+    result_queue    = multiprocessing.Queue(maxsize=max_size)
+    telemetry_queue = multiprocessing.Queue(maxsize=100)
 
-    # ── 4. Instantiate Input (Dependency Injection of Core) ──
-    InputClass = INPUT_DRIVERS.get(input_driver_key)
-    if not InputClass:
-        print(f"Unknown input: {input_driver_key}")
-        sys.exit(1)
-    
-    reader = InputClass(service=engine, file_path=file_path)
+    print("[Bootstrap] Queues created.")
 
-    # ── 5. Execution ──
-    # If the output is the UI, we let Streamlit handle the display flow
-    # If it's console/graphics, we print the status to terminal
-    if output_driver_key != "ui":
-        print(f"[Pipeline] Running: {input_driver_key} -> {output_driver_key}")
-    
-    reader.run()
+    # ── 2. Telemetry monitor (Subject) ────────────────────────────────
+    telemetry = PipelineTelemetry(raw_queue, processed_queue, result_queue, max_size)
+
+    # Telemetry pushes snapshots into telemetry_queue for the dashboard process
+    class QueueTelemetryObserver:
+        def on_telemetry_update(self, snap: dict) -> None:
+            try:
+                telemetry_queue.put_nowait(snap)
+            except Exception:
+                pass  # Queue full — skip this snapshot
+
+    telemetry.subscribe(QueueTelemetryObserver())
+    telemetry.start()
+    print("[Bootstrap] Telemetry monitor started.")
+
+    # ── 3. Dashboard process ──────────────────────────────────────────
+    dash_proc = multiprocessing.Process(
+        target=dashboard_process,
+        args=(result_queue, telemetry_queue, config),
+        daemon=False
+    )
+    dash_proc.start()
+    print("[Bootstrap] Dashboard process started.")
+
+    # ── 4. Aggregator process (Gather node) ───────────────────────────
+    agg_proc = multiprocessing.Process(
+        target=aggregator_process,
+        args=(processed_queue, result_queue, window_size),
+        daemon=True
+    )
+    agg_proc.start()
+    print("[Bootstrap] Aggregator process started.")
+
+    # ── 5. Worker processes (Scatter — N parallel verifiers) ──────────
+    workers = []
+    for i in range(parallelism):
+        w = multiprocessing.Process(
+            target=worker_process,
+            args=(raw_queue, processed_queue, secret_key, iterations, i),
+            daemon=True
+        )
+        w.start()
+        workers.append(w)
+    print(f"[Bootstrap] {parallelism} worker processes started.")
+
+    # ── 6. Input process (Producer) ───────────────────────────────────
+    inp_proc = multiprocessing.Process(
+        target=input_process,
+        args=(config, raw_queue),
+        daemon=True
+    )
+    inp_proc.start()
+    print("[Bootstrap] Input process started.")
+    print("[Bootstrap] Pipeline running — close the dashboard window to exit.\n")
+
+    # ── Wait for dashboard to finish ──────────────────────────────────
+    dash_proc.join()
+    telemetry.stop()
+    print("[Bootstrap] Pipeline complete.")
+
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()   # Required for Windows
     bootstrap()
