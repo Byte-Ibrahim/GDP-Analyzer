@@ -1,83 +1,68 @@
 """
 plugins/inputs.py
 -----------------
-Input plugins: CSVReader, JSONReader.
+Phase 3: Generic, schema-driven CSV reader.
 
-Each calls service.execute(raw_data) to hand data to the Core.
-They do NOT import anything from core/ except the PipelineService Protocol
-(which is only used for type-hinting — no hard coupling).
-
-Satisfies the PipelineService contract via duck typing.
+- Reads column mappings from config (schema_mapping)
+- Casts each field to the correct type (string/integer/float)
+- Completely domain-agnostic — works for ANY dataset
+- Feeds packets into raw_queue one by one with configurable delay
+- Does NOT know anything about Core internals
 """
 
 import csv
-import json
-from functools import reduce
-from typing import Any, List
+import time
+import multiprocessing
+from typing import Any
 
 
-class CSVReader:
-
-    def __init__(self, service, file_path: str):
-        
-        self.service   = service
-        self.file_path = file_path
-
-    def run(self) -> None:
-        raw_data = self.load()
-        self.service.execute(raw_data)
-
-    def load(self) -> List[dict]:
-        try:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                year_cols = list(filter(lambda col: col.strip().isdigit(), reader.fieldnames))
-
-                rows = list(map(
-                    lambda row: list(map(
-                        lambda year: {
-                            "country":   row.get("Country Name", "").strip(),
-                            "continent": row.get("Continent", "").strip(),
-                            "year":      int(year),
-                            "gdp":       float(row[year]) if row[year].strip() else None
-                        },
-                        year_cols
-                    )),
-                    reader
-                ))
-
-            return reduce(lambda a, b: a + b, rows, [])
-
-        except FileNotFoundError:
-            raise Exception(f"[CSVReader] File not found: {self.file_path}")
+# ── Type casters ──────────────────────────────────────────────────────
+TYPE_CASTERS = {
+    "string":  str,
+    "integer": int,
+    "float":   float,
+}
 
 
-class JSONReader:
+def input_process(config: dict, raw_queue: multiprocessing.Queue) -> None:
+    """
+    Reads CSV row by row, maps columns to internal names,
+    casts types, and pushes packets into raw_queue.
+    Runs as a standalone process (no class needed — plain function).
+    """
+    dataset_path   = config.get("dataset_path", "data/data.csv")
+    delay          = config.get("pipeline_dynamics", {}).get("input_delay_seconds", 0.01)
+    schema_columns = config.get("schema_mapping", {}).get("columns", [])
 
-    def __init__(self, service, file_path: str):
-        self.service   = service
-        self.file_path = file_path
+    # Build mapping: source_name -> (internal_mapping, caster)
+    column_map = {
+        col["source_name"]: (col["internal_mapping"], TYPE_CASTERS.get(col["data_type"], str))
+        for col in schema_columns
+    }
 
-    def run(self) -> None:
-        raw_data = self.load()
-        self.service.execute(raw_data)
+    try:
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                packet = {}
+                valid = True
 
-    def load(self) -> List[dict]:
-        try:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                for source_name, (internal_name, caster) in column_map.items():
+                    raw_val = row.get(source_name, "").strip()
+                    try:
+                        packet[internal_name] = caster(raw_val)
+                    except (ValueError, TypeError):
+                        valid = False
+                        break
 
-            return list(map(
-                lambda r: {
-                    "country":   str(r.get("country", "")).strip(),
-                    "continent": str(r.get("continent", "")).strip(),
-                    "year":      int(r.get("year", 0)),
-                    "gdp":       float(r["gdp"]) if r.get("gdp") is not None else None
-                },
-                data
-            ))
+                if valid:
+                    raw_queue.put(packet)
+                    time.sleep(delay)
 
-        except FileNotFoundError:
-            raise Exception(f"[JSONReader] File not found: {self.file_path}")
-        except json.JSONDecodeError:
-            raise Exception(f"[JSONReader] Invalid JSON in: {self.file_path}")
+    except FileNotFoundError:
+        print(f"[InputProcess] File not found: {dataset_path}")
+
+    finally:
+        # Send poison pill to shut down workers
+        raw_queue.put(None)
+        print("[InputProcess] Done — poison pill sent.")
